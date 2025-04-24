@@ -11,7 +11,10 @@ import os
 import wandb
 import pandas as pd
 import pickle
+from torch.nn.utils.rnn import pad_sequence
+from tqdm import tqdm
 from dotenv import load_dotenv
+import time
 load_dotenv()
 
 # Set device for GPU support
@@ -98,40 +101,46 @@ def load_tokenized_triples_from_pickle(path):
 # Step 9: Training loop with validation, early stopping, best model saving, and wandb logging
 
 
-def evaluate(val_triples, encoder_q, encoder_d, word2idx):
+def evaluate(val_triples, encoder_q, encoder_d, word2idx, batch_size=64):
     encoder_q.eval()
     encoder_d.eval()
     total_loss = 0
+    batches = create_batches(val_triples, word2idx, batch_size)
+    print("Starting validation...")
     with torch.no_grad():
-        for triple in val_triples:
-            padded_ids = process_tokenized_tokens(triple, word2idx)
-            q = encoder_q(padded_ids[0].unsqueeze(0).to(device))
-            pos = encoder_d(padded_ids[1].unsqueeze(0).to(device))
-            neg = encoder_d(padded_ids[2].unsqueeze(0).to(device))
-            loss = triplet_loss(q, pos, neg)
+        for i, (q, pos, neg) in enumerate(tqdm(batches, desc="Validation")):
+            q_enc = encoder_q(q)
+            pos_enc = encoder_d(pos)
+            neg_enc = encoder_d(neg)
+            loss = triplet_loss(q_enc, pos_enc, neg_enc)
+            if i % 100 == 0:
+                print(f"[Validation] Batch {i}, Loss: {loss.item():.4f}")
             total_loss += loss.item()
-    return total_loss / len(val_triples)
+    return total_loss / len(batches)
 
 
-def evaluate_test(test_triples, encoder_q, encoder_d, word2idx):
+def evaluate_test(test_triples, encoder_q, encoder_d, word2idx, batch_size=64):
     encoder_q.eval()
     encoder_d.eval()
     total_loss = 0
     cos_pos_all, cos_neg_all = [], []
+    batches = create_batches(test_triples, word2idx, batch_size)
+    print("Starting test evaluation...")
     with torch.no_grad():
-        for triple in test_triples:
-            padded_ids = process_tokenized_tokens(triple, word2idx)
-            q = encoder_q(padded_ids[0].unsqueeze(0).to(device))
-            pos = encoder_d(padded_ids[1].unsqueeze(0).to(device))
-            neg = encoder_d(padded_ids[2].unsqueeze(0).to(device))
-            loss = triplet_loss(q, pos, neg)
+        for i, (q, pos, neg) in enumerate(tqdm(batches, desc="Testing")):
+            q_enc = encoder_q(q)
+            pos_enc = encoder_d(pos)
+            neg_enc = encoder_d(neg)
+            loss = triplet_loss(q_enc, pos_enc, neg_enc)
+            if i % 100 == 0:
+                print(f"[Test] Batch {i}, Loss: {loss.item():.4f}")
             total_loss += loss.item()
-            cos_pos = F.cosine_similarity(q, pos)
-            cos_neg = F.cosine_similarity(q, neg)
-            cos_pos_all.append(cos_pos.item())
-            cos_neg_all.append(cos_neg.item())
+            cos_pos = F.cosine_similarity(q_enc, pos_enc)
+            cos_neg = F.cosine_similarity(q_enc, neg_enc)
+            cos_pos_all.extend(cos_pos.cpu().tolist())
+            cos_neg_all.extend(cos_neg.cpu().tolist())
 
-    test_loss = total_loss / len(test_triples)
+    test_loss = total_loss / len(batches)
     wandb.log({
         "test_loss": test_loss,
         "cos_sim/positive": wandb.Histogram(cos_pos_all),
@@ -139,15 +148,25 @@ def evaluate_test(test_triples, encoder_q, encoder_d, word2idx):
     })
     print(f"Test Loss: {test_loss:.4f}")
 
+def create_batches(triples, word2idx, batch_size):
+    batches = []
+    for i in range(0, len(triples), batch_size):
+        batch = triples[i:i+batch_size]
+        queries, positives, negatives = zip(*batch)
+        q_ids = [torch.tensor([word2idx.get(t, 0) for t in q], dtype=torch.long) for q in queries]
+        p_ids = [torch.tensor([word2idx.get(t, 0) for t in p], dtype=torch.long) for p in positives]
+        n_ids = [torch.tensor([word2idx.get(t, 0) for t in n], dtype=torch.long) for n in negatives]
+        q_pad = pad_sequence(q_ids, batch_first=True).to(device)
+        p_pad = pad_sequence(p_ids, batch_first=True).to(device)
+        n_pad = pad_sequence(n_ids, batch_first=True).to(device)
+        batches.append((q_pad, p_pad, n_pad))
+    return batches
 
-def train(triples, encoder_q, encoder_d, word2idx, epochs=5, lr=1e-3, val_triples=None, test_triples=None, patience=2, save_dir="models"):
+def train(triples, encoder_q, encoder_d, word2idx, epochs=5, lr=1e-3, val_triples=None, test_triples=None, patience=2, save_dir="models", batch_size=64):
     os.makedirs(save_dir, exist_ok=True)
     encoder_q.to(device)
     encoder_d.to(device)
-    optimizer = torch.optim.Adam(
-        list(encoder_q.parameters()) + list(encoder_d.parameters()), lr=lr)
-    encoder_q.train()
-    encoder_d.train()
+    optimizer = torch.optim.Adam(list(encoder_q.parameters()) + list(encoder_d.parameters()), lr=lr)
 
     wandb.init(project="two-tower-rnn", config={"epochs": epochs, "lr": lr})
     wandb.watch([encoder_q, encoder_d], log='all')
@@ -155,14 +174,24 @@ def train(triples, encoder_q, encoder_d, word2idx, epochs=5, lr=1e-3, val_triple
     best_val_loss = float('inf')
     patience_counter = 0
 
+    print(f"Starting training for {epochs} epochs on {len(triples)} triples...")
+
     for epoch in range(epochs):
-        total_loss = 0
+        print(f"\n[Epoch {epoch + 1}] Starting new epoch...")
+        encoder_q.train()
+        encoder_d.train()
         random.shuffle(triples)
-        for triple in triples:
-            padded_ids = process_tokenized_tokens(triple, word2idx)
-            q = encoder_q(padded_ids[0].unsqueeze(0).to(device))
-            pos = encoder_d(padded_ids[1].unsqueeze(0).to(device))
-            neg = encoder_d(padded_ids[2].unsqueeze(0).to(device))
+        batches = create_batches(triples, word2idx, batch_size)
+        total_loss = 0
+        start_time = time.time()
+
+        for i, (q_batch, p_batch, n_batch) in enumerate(tqdm(batches, desc=f"Epoch {epoch + 1}")):
+            if i == 0:
+                print(f"[Epoch {epoch + 1}] Starting batch loop with {len(batches)} batches")
+
+            q = encoder_q(q_batch)
+            pos = encoder_d(p_batch)
+            neg = encoder_d(n_batch)
             loss = triplet_loss(q, pos, neg)
 
             optimizer.zero_grad()
@@ -171,24 +200,24 @@ def train(triples, encoder_q, encoder_d, word2idx, epochs=5, lr=1e-3, val_triple
 
             total_loss += loss.item()
 
-        avg_train_loss = total_loss / len(triples)
-        val_loss = evaluate(val_triples, encoder_q, encoder_d,
-                            word2idx) if val_triples else None
+            if i % 10 == 0:
+                avg_loss_so_far = total_loss / (i + 1)
+                print(f"[Epoch {epoch + 1}][Batch {i}] Loss: {loss.item():.4f}, Avg: {avg_loss_so_far:.4f}")
 
-        print(f"Epoch {epoch + 1}, Train Loss: {avg_train_loss:.4f}" +
-              (f", Val Loss: {val_loss:.4f}" if val_loss is not None else ""))
+        epoch_time = time.time() - start_time
+        avg_train_loss = total_loss / len(batches)
+        val_loss = evaluate(val_triples, encoder_q, encoder_d, word2idx) if val_triples else None
 
-        wandb.log({"loss/train": avg_train_loss,
-                  "loss/val": val_loss, "epoch": epoch + 1})
+        print(f"[Epoch {epoch + 1}] Completed in {epoch_time:.2f}s. Train Loss: {avg_train_loss:.4f}" + (f", Val Loss: {val_loss:.4f}" if val_loss is not None else ""))
+
+        wandb.log({"loss/train": avg_train_loss, "loss/val": val_loss, "epoch": epoch + 1})
 
         if val_triples:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
-                torch.save(encoder_q.state_dict(), os.path.join(
-                    save_dir, "best_encoder_q.pt"))
-                torch.save(encoder_d.state_dict(), os.path.join(
-                    save_dir, "best_encoder_d.pt"))
+                torch.save(encoder_q.state_dict(), os.path.join(save_dir, "best_encoder_q.pt"))
+                torch.save(encoder_d.state_dict(), os.path.join(save_dir, "best_encoder_d.pt"))
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
@@ -203,14 +232,16 @@ def train(triples, encoder_q, encoder_d, word2idx, epochs=5, lr=1e-3, val_triple
 if __name__ == "__main__":
 
     # Paths to your prepared data
-    train_path = "tokenized/train_tokenized.pkl"
-    val_path = "tokenized/valid_tokenized.pkl"
-    test_path = "tokenized/test_tokenized.pkl"
-    vocab_path = "vocab.pkl"
+    train_path = "tokenizedjson/train_tokenized.pkl"
+    val_path = "tokenizedjson/validation_tokenized.pkl"
+    test_path = "tokenizedjson/test_tokenized.pkl"
+
+    vocab_path = "new_vocab.pkl"
 
     # Load vocab and embedding matrix
     embedding_matrix, word2idx = load_vocab_and_build_matrix(vocab_path)
-
+    # ✅ Save matrix for reuse in evaluation and corpus encoding
+    torch.save(embedding_matrix, "embedding_matrix.pt")
     # Load tokenized triples
     train_triples = load_tokenized_triples_from_pickle(train_path)
     val_triples = load_tokenized_triples_from_pickle(val_path)

@@ -5,3 +5,5 @@ numpy
 tqdm
 wandb
 python-dotenv
+gensim
+matplotlib

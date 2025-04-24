@@ -1,14 +1,19 @@
+import random
 import pickle
 
-file_path = "tokenized/test_tokenized.pkl"
-with open(file_path, "rb") as f:
-    data = pickle.load(f)
+with open("tokenized/train_tokenized.pkl", "rb") as f:
+    train_data = pickle.load(f)
 
-# Print the type and keys (if it's a dictionary)
-print("Type of data:", type(data))
-if isinstance(data, dict):
-    print("Keys in data:", data.keys())
+triplets = list(zip(
+    train_data["tokenized_queries"],
+    train_data["tokenized_positives"],
+    train_data["tokenized_negatives"]
+))
 
-# If it's a list of dictionaries, check the first element
-if isinstance(data, list) and len(data) > 0:
-    print("First element keys:", data[0].keys())
+print("\n🔍 Inspecting 5 random training triplets:")
+for i in random.sample(range(len(triplets)), 5):
+    q, pos, neg = triplets[i]
+    print(f"\nTriplet {i}:")
+    print(f"  Query   : {' '.join(q[:20])}...")
+    print(f"  Positive: {' '.join(pos[:30])}...")
+    print(f"  Negative: {' '.join(neg[:30])}...")
