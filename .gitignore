@@ -30,6 +30,7 @@ saved_artifacts/
 *.parquet
 *.csv
 *.pkl
+*.pth
 
 # Logs
 *.log
@@ -69,3 +70,6 @@ coverage.xml
 # Environment config
 .env
 .env.*
+.env
+wandb_secrets.env
+wandb/
